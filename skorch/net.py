@@ -20,11 +20,11 @@ from skorch.dataset import get_len
 from skorch.dataset import unpack_data
 from skorch.dataset import uses_placeholder_y
 from skorch.exceptions import DeviceWarning
-from skorch.exceptions import NotInitializedError
 from skorch.history import History
 from skorch.setter import optimizer_setter
 from skorch.utils import FirstStepAccumulator
 from skorch.utils import TeeGenerator
+from skorch.utils import check_is_fitted
 from skorch.utils import duplicate_items
 from skorch.utils import get_map_location
 from skorch.utils import is_dataset
@@ -229,25 +229,20 @@ class NeuralNet:
         initialized = kwargs.pop('initialized_', False)
         virtual_params = kwargs.pop('virtual_params_', dict())
 
-        # catch arguments that seem to not belong anywhere
-        unexpected_kwargs = []
-        for key in kwargs:
-            if key.endswith('_'):
-                continue
-            if any(key.startswith(p) for p in self.prefixes_):
-                continue
-            unexpected_kwargs.append(key)
-        if unexpected_kwargs:
-            msg = ("__init__() got unexpected argument(s) {}. "
-                   "Either you made a typo, or you added new arguments "
-                   "in a subclass; if that is the case, the subclass "
-                   "should deal with the new arguments explicitely.")
-            raise TypeError(msg.format(', '.join(sorted(unexpected_kwargs))))
+        kwargs = self._check_kwargs(kwargs)
         vars(self).update(kwargs)
 
-        self.history = history
+        self.history_ = history
         self.initialized_ = initialized
         self.virtual_params_ = virtual_params
+
+    @property
+    def history(self):
+        return self.history_
+
+    @history.setter
+    def history(self, value):
+        self.history_ = value
 
     @property
     def _default_callbacks(self):
@@ -536,7 +531,7 @@ class NeuralNet:
 
     def initialize_history(self):
         """Initializes the history."""
-        self.history = History()
+        self.history_ = History()
 
     def initialize(self):
         """Initializes all components of the :class:`.NeuralNet` and
@@ -605,7 +600,6 @@ class NeuralNet:
 
         """
         self.module_.train()
-        self.optimizer_.zero_grad()
         y_pred = self.infer(Xi, **fit_params)
         loss = self.get_loss(y_pred, yi, X=Xi, training=True)
         loss.backward()
@@ -668,6 +662,7 @@ class NeuralNet:
             step_accumulator.store_step(step)
             return step['loss']
         self.optimizer_.step(step_fn)
+        self.optimizer_.zero_grad()
         return step_accumulator.get_step()
 
     def evaluation_step(self, Xi, training=False):
@@ -679,6 +674,7 @@ class NeuralNet:
         like dropout by setting ``training=True``.
 
         """
+        self.check_is_fitted()
         with torch.set_grad_enabled(training):
             self.module_.train(training)
             return self.infer(Xi)
@@ -741,10 +737,10 @@ class NeuralNet:
                 yi_res = yi if not y_train_is_ph else None
                 self.notify('on_batch_begin', X=Xi, y=yi_res, training=True)
                 step = self.train_step(Xi, yi, **fit_params)
+                train_batch_count += 1
                 self.history.record_batch('train_loss', step['loss'].item())
                 self.history.record_batch('train_batch_size', get_len(Xi))
                 self.notify('on_batch_end', X=Xi, y=yi_res, training=True, **step)
-                train_batch_count += 1
             self.history.record("train_batch_count", train_batch_count)
 
             if dataset_valid is None:
@@ -757,10 +753,10 @@ class NeuralNet:
                 yi_res = yi if not y_valid_is_ph else None
                 self.notify('on_batch_begin', X=Xi, y=yi_res, training=False)
                 step = self.validation_step(Xi, yi, **fit_params)
+                valid_batch_count += 1
                 self.history.record_batch('valid_loss', step['loss'].item())
                 self.history.record_batch('valid_batch_size', get_len(Xi))
                 self.notify('on_batch_end', X=Xi, y=yi_res, training=False, **step)
-                valid_batch_count += 1
             self.history.record("valid_batch_count", valid_batch_count)
 
             self.notify('on_epoch_end', **on_epoch_kwargs)
@@ -851,6 +847,27 @@ class NeuralNet:
 
         self.partial_fit(X, y, **fit_params)
         return self
+
+    def check_is_fitted(self, attributes=None, *args, **kwargs):
+        """Checks whether the net is initialized
+
+        Parameters
+        ----------
+        attributes : iterable of str or None (default=None)
+          All the attributes that are strictly required of a fitted
+          net. By default, this is the `module_` attribute.
+
+        Other arguments as in
+        ``sklearn.utils.validation.check_is_fitted``.
+
+        Raises
+        ------
+        skorch.exceptions.NotInitializedError
+          When the given attributes are not present.
+
+        """
+        attributes = attributes or ['module_']
+        check_is_fitted(self, attributes, *args, **kwargs)
 
     def forward_iter(self, X, training=False, device='cpu'):
         """Yield outputs of module forward calls on each batch of data.
@@ -1254,7 +1271,15 @@ class NeuralNet:
         return [pgroups], kwargs
 
     def _get_param_names(self):
-        return self.__dict__.keys()
+        return (k for k in self.__dict__.keys() if k != 'history_')
+
+    def _get_param_names_new(self):
+        # TODO: This will be the new behavior for _get_param_names in
+        # a future release. This is to make get_params work as in
+        # sklearn, i.e. not returning "learned" attributes (ending on
+        # '_'). Once the transition period has passed, remove the old
+        # code and use the new one instead.
+        return (k for k in self.__dict__ if not k.endswith('_'))
 
     def _get_params_callbacks(self, deep=True):
         """sklearn's .get_params checks for `hasattr(value,
@@ -1284,6 +1309,61 @@ class NeuralNet:
         params_cb = self._get_params_callbacks(deep=deep)
         params.update(params_cb)
         return params
+
+    def _check_kwargs(self, kwargs):
+        """Check argument names passed at initialization.
+
+        Raises
+        ------
+        TypeError
+          Raises a TypeError if one or more arguments don't seem to
+          match or are malformed.
+
+        Returns
+        -------
+        kwargs: dict
+          Return the passed keyword arguments.
+
+        Example
+        -------
+        >>> net = NeuralNetClassifier(MyModule, iterator_train_shuffle=True)
+        TypeError: Got an unexpected argument iterator_train_shuffle,
+        did you mean iterator_train__shuffle?
+
+        """
+        unexpected_kwargs = []
+        missing_dunder_kwargs = []
+        for key in kwargs:
+            if key.endswith('_'):
+                continue
+            for prefix in self.prefixes_:
+                if key.startswith(prefix):
+                    if not key.startswith(prefix + '__'):
+                        missing_dunder_kwargs.append((prefix, key))
+                    break
+            else:  # no break means key didn't match a prefix
+                unexpected_kwargs.append(key)
+
+        msgs = []
+        if unexpected_kwargs:
+            tmpl = ("__init__() got unexpected argument(s) {}. "
+                    "Either you made a typo, or you added new arguments "
+                    "in a subclass; if that is the case, the subclass "
+                    "should deal with the new arguments explicitely.")
+            msg = tmpl.format(', '.join(sorted(unexpected_kwargs)))
+            msgs.append(msg)
+
+        for prefix, key in sorted(missing_dunder_kwargs, key=lambda tup: tup[1]):
+            tmpl = "Got an unexpected argument {}, did you mean {}?"
+            suffix = key[len(prefix):].lstrip('_')
+            suggestion = prefix + '__' + suffix
+            msgs.append(tmpl.format(key, suggestion))
+
+        if msgs:
+            full_msg = '\n'.join(msgs)
+            raise TypeError(full_msg)
+
+        return kwargs
 
     def _check_deprecated_params(self, **kwargs):
         pass
@@ -1319,10 +1399,9 @@ class NeuralNet:
             if key.endswith('_'):
                 raise ValueError(
                     "Something went wrong here. Please open an issue on "
-                    "https://github.com/dnouri/skorch/issues detailing what "
+                    "https://github.com/skorch-dev/skorch/issues detailing what "
                     "caused this error.")
-            else:
-                setattr(self, key, val)
+            setattr(self, key, val)
 
         # Below: Re-initialize parts of the net if necessary.
 
@@ -1467,19 +1546,19 @@ class NeuralNet:
 
         """
         if f_params is not None:
-            if not hasattr(self, 'module_'):
-                raise NotInitializedError(
-                    "Cannot save parameters of an un-initialized model. "
-                    "Please initialize first by calling .initialize() "
-                    "or by fitting the model with .fit(...).")
+            msg = (
+                "Cannot save parameters of an un-initialized model. "
+                "Please initialize first by calling .initialize() "
+                "or by fitting the model with .fit(...).")
+            self.check_is_fitted(msg=msg)
             torch.save(self.module_.state_dict(), f_params)
 
         if f_optimizer is not None:
-            if not hasattr(self, 'optimizer_'):
-                raise NotInitializedError(
-                    "Cannot save state of an un-initialized optimizer. "
-                    "Please initialize first by calling .initialize() "
-                    "or by fitting the model with .fit(...).")
+            msg = (
+                "Cannot save state of an un-initialized optimizer. "
+                "Please initialize first by calling .initialize() "
+                "or by fitting the model with .fit(...).")
+            self.check_is_fitted(attributes=['optimizer_'], msg=msg)
             torch.save(self.optimizer_.state_dict(), f_optimizer)
 
         if f_history is not None:
@@ -1550,6 +1629,8 @@ class NeuralNet:
             self.history = History.from_file(f_history)
 
         if checkpoint is not None:
+            if not self.initialized_:
+                self.initialize()
             if f_history is None and checkpoint.f_history is not None:
                 self.history = History.from_file(checkpoint.f_history_)
             formatted_files = checkpoint.get_formatted_files(self)
@@ -1557,26 +1638,24 @@ class NeuralNet:
             f_optimizer = f_optimizer or formatted_files['f_optimizer']
 
         if f_params is not None:
-            if not hasattr(self, 'module_'):
-                raise NotInitializedError(
-                    "Cannot load parameters of an un-initialized model. "
-                    "Please initialize first by calling .initialize() "
-                    "or by fitting the model with .fit(...).")
+            msg = (
+                "Cannot load parameters of an un-initialized model. "
+                "Please initialize first by calling .initialize() "
+                "or by fitting the model with .fit(...).")
+            self.check_is_fitted(msg=msg)
             state_dict = _get_state_dict(f_params)
             self.module_.load_state_dict(state_dict)
 
         if f_optimizer is not None:
-            if not hasattr(self, 'optimizer_'):
-                raise NotInitializedError(
-                    "Cannot load state of an un-initialized optimizer. "
-                    "Please initialize first by calling .initialize() "
-                    "or by fitting the model with .fit(...).")
+            msg = (
+                "Cannot load state of an un-initialized optimizer. "
+                "Please initialize first by calling .initialize() "
+                "or by fitting the model with .fit(...).")
+            self.check_is_fitted(attributes=['optimizer_'], msg=msg)
             state_dict = _get_state_dict(f_optimizer)
             self.optimizer_.load_state_dict(state_dict)
 
     def __repr__(self):
-        params = self.get_params(deep=False)
-
         to_include = ['module']
         to_exclude = []
         parts = [str(self.__class__) + '[uninitialized](']
@@ -1585,7 +1664,7 @@ class NeuralNet:
             to_include = ['module_']
             to_exclude = ['module__']
 
-        for key, val in sorted(params.items()):
+        for key, val in sorted(self.__dict__.items()):
             if not any(key.startswith(prefix) for prefix in to_include):
                 continue
             if any(key.startswith(prefix) for prefix in to_exclude):

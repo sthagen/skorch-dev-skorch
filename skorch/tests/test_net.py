@@ -14,26 +14,29 @@ from unittest.mock import Mock
 from unittest.mock import patch
 import sys
 from contextlib import ExitStack
-import tempfile
 
 import numpy as np
+from packaging import version
 import pytest
+from sklearn.base import clone
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.base import clone
 import torch
 from torch import nn
 from flaky import flaky
 
+from skorch.exceptions import NotInitializedError
+from skorch.tests.conftest import INFERENCE_METHODS
 from skorch.utils import flatten
 from skorch.utils import to_numpy
 from skorch.utils import is_torch_data_type
 
 
 torch.manual_seed(0)
+ACCURACY_EXPECTED = 0.65
 
 
 # pylint: disable=too-many-public-methods
@@ -106,7 +109,7 @@ class TestNeuralNet:
         # remove mock callback
         net_fit.callbacks_ = [(n, cb) for n, cb in net_fit.callbacks_
                               if not isinstance(cb, Mock)]
-        net_clone = clone(net_fit)
+        net_clone = copy.deepcopy(net_fit)
         net_fit.callbacks = callbacks
         net_fit.callbacks_ = callbacks_
         return net_clone
@@ -117,7 +120,7 @@ class TestNeuralNet:
         # This test comes from [issue #317], and makes sure that models
         # can be trained after copying (which is really pickling).
         #
-        # [issue #317]:https://github.com/dnouri/skorch/issues/317
+        # [issue #317]:https://github.com/skorch-dev/skorch/issues/317
         X, y = data
         n1 = net_cls(module_cls)
         n1.partial_fit(X, y, epochs=1)
@@ -179,9 +182,85 @@ class TestNeuralNet:
                     "should deal with the new arguments explicitely.")
         assert e.value.args[0] == expected
 
+    @pytest.mark.parametrize('name, suggestion', [
+        ('iterator_train_shuffle', 'iterator_train__shuffle'),
+        ('optimizer_momentum', 'optimizer__momentum'),
+        ('modulenum_units', 'module__num_units'),
+        ('criterionreduce', 'criterion__reduce'),
+        ('callbacks_mycb__foo', 'callbacks__mycb__foo'),
+    ])
+    def test_net_init_missing_dunder_in_prefix_argument(
+            self, net_cls, module_cls, name, suggestion):
+        # forgot to use double-underscore notation
+        with pytest.raises(TypeError) as e:
+            net_cls(module_cls, **{name: 123})
+
+        tmpl = "Got an unexpected argument {}, did you mean {}?"
+        expected = tmpl.format(name, suggestion)
+        assert e.value.args[0] == expected
+
+    def test_net_init_missing_dunder_in_2_prefix_arguments(
+            self, net_cls, module_cls):
+        # forgot to use double-underscore notation in 2 arguments
+        with pytest.raises(TypeError) as e:
+            net_cls(
+                module_cls,
+                max_epochs=7,  # correct
+                iterator_train_shuffle=True,  # uses _ instead of __
+                optimizerlr=0.5,  # missing __
+            )
+        expected = ("Got an unexpected argument iterator_train_shuffle, "
+                    "did you mean iterator_train__shuffle?\n"
+                    "Got an unexpected argument optimizerlr, "
+                    "did you mean optimizer__lr?")
+        assert e.value.args[0] == expected
+
+    def test_net_init_missing_dunder_and_unknown(
+            self, net_cls, module_cls):
+        # unknown argument and forgot to use double-underscore notation
+        with pytest.raises(TypeError) as e:
+            net_cls(
+                module_cls,
+                foobar=123,
+                iterator_train_shuffle=True,
+            )
+        expected = ("__init__() got unexpected argument(s) foobar. "
+                    "Either you made a typo, or you added new arguments "
+                    "in a subclass; if that is the case, the subclass "
+                    "should deal with the new arguments explicitely.\n"
+                    "Got an unexpected argument iterator_train_shuffle, "
+                    "did you mean iterator_train__shuffle?")
+        assert e.value.args[0] == expected
+
     def test_fit(self, net_fit):
         # fitting does not raise anything
         pass
+
+    @pytest.mark.parametrize('method', INFERENCE_METHODS)
+    def test_not_fitted_raises(self, net_cls, module_cls, data, method):
+        from skorch.exceptions import NotInitializedError
+        net = net_cls(module_cls)
+        X = data[0]
+        with pytest.raises(NotInitializedError) as exc:
+            # we call `list` because `forward_iter` is lazy
+            list(getattr(net, method)(X))
+
+        msg = ("This NeuralNetClassifier instance is not initialized yet. "
+               "Call 'initialize' or 'fit' with appropriate arguments "
+               "before using this method.")
+        assert exc.value.args[0] == msg
+
+    def test_not_fitted_other_attributes(self, module_cls):
+        # pass attributes to check for explicitly
+        with patch('skorch.net.check_is_fitted') as check:
+            from skorch import NeuralNetClassifier
+
+            net = NeuralNetClassifier(module_cls)
+            attributes = ['foo', 'bar_']
+
+            net.check_is_fitted(attributes=attributes)
+            args = check.call_args_list[0][0][1]
+            assert args == attributes
 
     @flaky(max_runs=3)
     def test_net_learns(self, net_cls, module_cls, data):
@@ -193,7 +272,7 @@ class TestNeuralNet:
         )
         net.fit(X, y)
         y_pred = net.predict(X)
-        assert accuracy_score(y, y_pred) > 0.65
+        assert accuracy_score(y, y_pred) > ACCURACY_EXPECTED
 
     def test_forward(self, net_fit, data):
         X = data[0]
@@ -466,8 +545,10 @@ class TestNeuralNet:
         assert np.allclose(orig_loss, new_loss)
         assert orig_steps == new_steps
 
+    @pytest.mark.parametrize("explicit_init", [True, False])
     def test_save_and_load_from_checkpoint(
-            self, net_cls, module_cls, data, checkpoint_cls, tmpdir):
+            self, net_cls, module_cls, data, checkpoint_cls, tmpdir,
+            explicit_init):
 
         skorch_dir = tmpdir.mkdir('skorch')
         f_params = skorch_dir.join('params.pt')
@@ -491,7 +572,9 @@ class TestNeuralNet:
 
         new_net = net_cls(
             module_cls, max_epochs=4, lr=0.1,
-            optimizer=torch.optim.Adam, callbacks=[cp]).initialize()
+            optimizer=torch.optim.Adam, callbacks=[cp])
+        if explicit_init:
+            new_net.initialize()
         new_net.load_params(checkpoint=cp)
 
         assert len(new_net.history) == 4
@@ -557,7 +640,7 @@ class TestNeuralNet:
             module_cls, max_epochs=5, lr=0.1,
             optimizer=torch.optim.Adam, callbacks=[
                 ('my_score', scoring), cp
-            ]).initialize()
+            ])
         new_net.load_params(checkpoint=cp)
 
         # original run saved checkpoint at epoch 3
@@ -1153,7 +1236,6 @@ class TestNeuralNet:
         # now initialized
         assert 'callbacks__myscore__scoring' in params
 
-    @pytest.mark.xfail
     def test_get_params_with_uninit_callbacks(self, net_cls, module_cls):
         from skorch.callbacks import EpochTimer
 
@@ -1166,6 +1248,48 @@ class TestNeuralNet:
         net.get_params()
         net.initialize()
         net.get_params()
+
+    @pytest.mark.new_get_params_behavior
+    @pytest.mark.xfail(strict=True)
+    def test_get_params_no_learned_params(self, net_fit):
+        # TODO: This test should fail for now but should succeed once
+        # we change the behavior of get_params to be more in line with
+        # sklearn. At that point, remove the decorators.
+        params = net_fit.get_params()
+        params_learned = set(filter(lambda x: x.endswith('_'), params))
+        assert not params_learned
+
+    @pytest.mark.new_get_params_behavior
+    @pytest.mark.xfail(strict=True)
+    def test_clone_results_in_uninitialized_net(
+            self, net_fit, data):
+        # TODO: This test should fail for now but should succeed once
+        # we change the behavior of get_params to be more in line with
+        # sklearn. At that point, remove the decorators.
+        X, y = data
+        accuracy = accuracy_score(net_fit.predict(X), y)
+        assert accuracy > ACCURACY_EXPECTED  # make sure net has learned
+
+        net_cloned = clone(net_fit).set_params(max_epochs=0)
+        net_cloned.callbacks_ = []
+        net_cloned.partial_fit(X, y)
+        accuracy_cloned = accuracy_score(net_cloned.predict(X), y)
+        assert accuracy_cloned < ACCURACY_EXPECTED
+
+        assert not net_cloned.history
+
+    @pytest.mark.new_get_params_behavior
+    def test_clone_copies_parameters(self, net_cls, module_cls):
+        kwargs = dict(
+            module__hidden_units=20,
+            lr=0.2,
+            iterator_train__batch_size=123,
+        )
+        net = net_cls(module_cls, **kwargs)
+        net_cloned = clone(net)
+        params = net_cloned.get_params()
+        for key, val in kwargs.items():
+            assert params[key] == val
 
     def test_with_initialized_module(self, net_cls, module_cls, data):
         X, y = data
@@ -1411,6 +1535,10 @@ class TestNeuralNet:
     )
   ),
 )"""
+        if version.parse(torch.__version__) >= version.parse('1.2'):
+            expected = expected.replace("Softmax()", "Softmax(dim=-1)")
+            expected = expected.replace("Dropout(p=0.5)",
+                                        "Dropout(p=0.5, inplace=False)")
         assert result == expected
 
     def test_repr_fitted_works(self, net_cls, module_cls, data):
@@ -1438,6 +1566,10 @@ class TestNeuralNet:
     )
   ),
 )"""
+        if version.parse(torch.__version__) >= version.parse('1.2'):
+            expected = expected.replace("Softmax()", "Softmax(dim=-1)")
+            expected = expected.replace("Dropout(p=0.5)",
+                                        "Dropout(p=0.5, inplace=False)")
         assert result == expected
 
     def test_fit_params_passed_to_module(self, net_cls, data):
@@ -2129,6 +2261,61 @@ class TestNeuralNet:
 
         assert net.optimizer_.param_groups[0]['lr'] == lr_pgroup_0_new
         assert net.optimizer_.param_groups[1]['lr'] == lr_pgroup_1_new
+
+    @pytest.mark.parametrize('acc_steps', [1, 2, 3, 5, 10])
+    def test_gradient_accumulation(self, net_cls, module_cls, data, acc_steps):
+        # Test if gradient accumulation technique is possible,
+        # i.e. performing a weight update only every couple of
+        # batches.
+        mock_optimizer = Mock()
+
+        class GradAccNet(net_cls):
+            """Net that accumulates gradients"""
+            def __init__(self, *args, acc_steps=acc_steps, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.acc_steps = acc_steps
+
+            def initialize(self):
+                # This is not necessary for gradient accumulation but
+                # only for testing purposes
+                super().initialize()
+                self.true_optimizer_ = self.optimizer_
+                mock_optimizer.step.side_effect = self.true_optimizer_.step
+                mock_optimizer.zero_grad.side_effect = self.true_optimizer_.zero_grad
+                self.optimizer_ = mock_optimizer
+
+            def get_loss(self, *args, **kwargs):
+                loss = super().get_loss(*args, **kwargs)
+                # because only every nth step is optimized
+                return loss / self.acc_steps
+
+            def train_step(self, Xi, yi, **fit_params):
+                """Perform gradient accumulation
+
+                Only optimize every 2nd batch.
+
+                """
+                # note that n_train_batches starts at 1 for each epoch
+                n_train_batches = len(self.history[-1, 'batches'])
+                step = self.train_step_single(Xi, yi, **fit_params)
+
+                if n_train_batches % self.acc_steps == 0:
+                    self.optimizer_.step()
+                    self.optimizer_.zero_grad()
+                return step
+
+        max_epochs = 5
+        net = GradAccNet(module_cls, max_epochs=max_epochs)
+        X, y = data
+        net.fit(X, y)
+
+        n = len(X) * 0.8  # number of training samples
+        b = np.ceil(n / net.batch_size)  # batches per epoch
+        s = b // acc_steps  # number of acc steps per epoch
+        calls_total = s * max_epochs
+        calls_step = mock_optimizer.step.call_count
+        calls_zero_grad = mock_optimizer.zero_grad.call_count
+        assert calls_total == calls_step == calls_zero_grad
 
 
 class TestNetSparseInput:

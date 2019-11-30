@@ -7,7 +7,10 @@ Only contains tests that are specific for regressor subclasses.
 from flaky import flaky
 import numpy as np
 import pytest
+from sklearn.base import clone
 import torch
+
+from skorch.tests.conftest import INFERENCE_METHODS
 
 
 torch.manual_seed(0)
@@ -56,9 +59,26 @@ class TestNeuralNetRegressor:
         X, y = data
         return net.fit(X, y)
 
+    def test_clone(self, net_fit):
+        clone(net_fit)
+
     def test_fit(self, net_fit):
         # fitting does not raise anything
         pass
+
+    @pytest.mark.parametrize('method', INFERENCE_METHODS)
+    def test_not_fitted_raises(self, net_cls, module_cls, data, method):
+        from skorch.exceptions import NotInitializedError
+        net = net_cls(module_cls)
+        X = data[0]
+        with pytest.raises(NotInitializedError) as exc:
+            # we call `list` because `forward_iter` is lazy
+            list(getattr(net, method)(X))
+
+        msg = ("This NeuralNetRegressor instance is not initialized "
+               "yet. Call 'initialize' or 'fit' with appropriate arguments "
+               "before using this method.")
+        assert exc.value.args[0] == msg
 
     @flaky(max_runs=3)
     def test_net_learns(self, net, net_cls, data, module_cls):

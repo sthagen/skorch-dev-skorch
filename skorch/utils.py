@@ -15,11 +15,14 @@ import warnings
 import numpy as np
 from scipy import sparse
 from sklearn.utils import safe_indexing
+from sklearn.exceptions import NotFittedError
+from sklearn.utils.validation import check_is_fitted as sklearn_check_is_fitted
 import torch
 from torch.nn.utils.rnn import PackedSequence
 from torch.utils.data.dataset import Subset
 
 from skorch.exceptions import DeviceWarning
+from skorch.exceptions import NotInitializedError
 
 
 class Ansi(Enum):
@@ -388,7 +391,6 @@ def noop(*args, **kwargs):
     This is useful for defining scoring callbacks that do not need a
     target extractor.
     """
-    pass
 
 
 @contextmanager
@@ -441,11 +443,6 @@ class FirstStepAccumulator:
         return self.step
 
 
-def _make_optimizer(pgroups, optimizer, filter_fn, **kwargs):
-    """Used by ``skorch.helper.filtered_optimizer`` to allow for pickling"""
-    return optimizer(filter_fn(pgroups), **kwargs)
-
-
 def _make_split(X, y, valid_ds, **kwargs):
     """Used by ``predefined_split`` to allow for pickling"""
     return X, valid_ds
@@ -481,6 +478,31 @@ def get_map_location(target_device, fallback_device='cpu'):
             ), DeviceWarning)
         map_location = torch.device(fallback_device)
     return map_location
+
+
+def check_is_fitted(estimator, attributes, msg=None, all_or_any=all):
+    """Checks whether the net is initialized.
+
+    Note: This calls ``sklearn.utils.validation.check_is_fitted``
+    under the hood, using exactly the same arguments and logic. The
+    only difference is that this function has an adapted error message
+    and raises a ``skorch.exception.NotInitializedError`` instead of
+    an ``sklearn.exceptions.NotFittedError``.
+
+    """
+    if msg is None:
+        msg = ("This %(name)s instance is not initialized yet. Call "
+               "'initialize' or 'fit' with appropriate arguments "
+               "before using this method.")
+    try:
+        sklearn_check_is_fitted(
+            estimator=estimator,
+            attributes=attributes,
+            msg=msg,
+            all_or_any=all_or_any,
+        )
+    except NotFittedError as e:
+        raise NotInitializedError(str(e))
 
 
 class TeeGenerator:
