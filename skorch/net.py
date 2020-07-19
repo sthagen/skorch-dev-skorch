@@ -662,12 +662,14 @@ class NeuralNet:
 
         """
         step_accumulator = self.get_train_step_accumulator()
+
         def step_fn():
+            self.optimizer_.zero_grad()
             step = self.train_step_single(Xi, yi, **fit_params)
             step_accumulator.store_step(step)
             return step['loss']
+
         self.optimizer_.step(step_fn)
-        self.optimizer_.zero_grad()
         return step_accumulator.get_step()
 
     def evaluation_step(self, Xi, training=False):
@@ -1210,12 +1212,16 @@ class NeuralNet:
 
         """
         dataset = self.get_dataset(X, y)
-        if self.train_split:
-            dataset_train, dataset_valid = self.train_split(
-                dataset, y, **fit_params)
-        else:
-            dataset_train, dataset_valid = dataset, None
-        return dataset_train, dataset_valid
+        if not self.train_split:
+            return dataset, None
+
+        # After a change in (#646),
+        # `y` is no longer passed to `self.train_split` if it is `None`.
+        # To revert to the previous behavior, remove the following two lines:
+        if y is None:
+            return self.train_split(dataset, **fit_params)
+
+        return self.train_split(dataset, y, **fit_params)
 
     def get_iterator(self, dataset, training=False):
         """Get an iterator that allows to loop over the batches of the
@@ -1314,7 +1320,8 @@ class NeuralNet:
         if params:
             pgroups.append({'params': [p for _, p in params]})
 
-        return [pgroups], kwargs
+        args = (pgroups,)
+        return args, kwargs
 
     def get_params_for_optimizer(self, prefix, named_parameters):
         """Collect and return init parameters for an optimizer.
@@ -1366,15 +1373,17 @@ class NeuralNet:
 
         Returns
         -------
-        pgroups : list
-          List of parameter groups.
+        args : tuple
+          All positional arguments for this optimizer (right now only
+          one, the parameter groups).
 
         kwargs : dict
           All other parameters for this optimizer, e.g. the learning
           rate.
 
         """
-        return self._get_params_for_optimizer(prefix, named_parameters)
+        args, kwargs = self._get_params_for_optimizer(prefix, named_parameters)
+        return args, kwargs
 
     def _get_param_names(self):
         return (k for k in self.__dict__ if not k.endswith('_'))

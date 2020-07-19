@@ -2138,13 +2138,21 @@ class TestNeuralNet:
         assert net.history[:, "train_batch_count"] == [train_batch_count]
         assert net.history[:, "valid_batch_count"] == [valid_batch_count]
 
+    @flaky(max_runs=3)
     def test_fit_lbfgs_optimizer(self, net_cls, module_cls, data):
         X, y = data
         net = net_cls(
             module_cls,
             optimizer=torch.optim.LBFGS,
-            batch_size=len(X))
+            lr=1.0,
+            batch_size=-1,
+        )
         net.fit(X, y)
+
+        last_epoch = net.history[-1]
+        assert last_epoch['train_loss'] < 1.0
+        assert last_epoch['valid_loss'] < 1.0
+        assert last_epoch['valid_acc'] > 0.75
 
     def test_accumulator_that_returns_last_value(
             self, net_cls, module_cls, data):
@@ -2270,6 +2278,38 @@ class TestNeuralNet:
 
         assert net.optimizer_.param_groups[0]['lr'] == lr_pgroup_0_new
         assert net.optimizer_.param_groups[1]['lr'] == lr_pgroup_1_new
+
+    def test_criterion_training_set_correctly(self, net_cls, module_cls, data):
+        # check that criterion's training attribute is set correctly
+
+        X, y = data[0][:50], data[1][:50]  # don't need all the data
+        side_effect = []
+
+        class MyCriterion(nn.NLLLoss):
+            """Criterion that records its training attribute"""
+            def forward(self, *args, **kwargs):
+                side_effect.append(self.training)
+                return super().forward(*args, **kwargs)
+
+        net = net_cls(module_cls, criterion=MyCriterion, max_epochs=1)
+        net.fit(X, y)
+
+        # called once with training=True for train step, once with
+        # training=False for validation step
+        assert side_effect == [True, False]
+
+        net.partial_fit(X, y)
+        # same logic as before
+        assert side_effect == [True, False, True, False]
+
+    def test_criterion_is_not_a_torch_module(self, net_cls, module_cls, data):
+        X, y = data[0][:50], data[1][:50]  # don't need all the data
+
+        def my_criterion():
+            return torch.nn.functional.nll_loss
+
+        net = net_cls(module_cls, criterion=my_criterion, max_epochs=1)
+        net.fit(X, y)  # does not raise
 
     @pytest.mark.parametrize('acc_steps', [1, 2, 3, 5, 10])
     def test_gradient_accumulation(self, net_cls, module_cls, data, acc_steps):
@@ -2457,6 +2497,48 @@ class TestNeuralNet:
         net.set_params(mymodule__hidden_units=99)
         hidden_units = net.mymodule_.state_dict()['sequential.3.weight'].shape[1]
         assert hidden_units == 99
+
+    @pytest.mark.parametrize("needs_y, train_split, raises", [
+        (False, None, ExitStack()),  # ExitStack = does not raise
+        (True, None, ExitStack()),
+        (False, "default", ExitStack()),  # Default parameters for NeuralNet
+        (True, "default", ExitStack()),  # Default parameters for NeuralNet
+        (False, lambda x: (x, x), ExitStack()),  # Earlier this was not allowed
+        (True, lambda x, y: (x, x), ExitStack()),  # Works for custom split
+        (True, lambda x: (x, x), pytest.raises(TypeError)),  # Raises an error
+    ])
+    def test_passes_y_to_train_split_when_not_none(
+            self, needs_y, train_split, raises):
+        from skorch.net import NeuralNet
+        from skorch.toy import MLPModule
+
+        # By default, `train_split=CVSplit(5)` in the `NeuralNet` definition
+        kwargs = {} if train_split == 'default' else {
+            'train_split': train_split}
+
+        # Dummy loss that ignores y_true
+        class UnsupervisedLoss(torch.nn.NLLLoss):
+            def forward(self, y_pred, _):
+                return y_pred.mean()
+
+        # Generate the dummy dataset
+        n_samples, n_features = 128, 10
+        X = np.random.rand(n_samples, n_features).astype(np.float32)
+        y = np.random.binomial(n=1, p=0.5, size=n_samples) if needs_y else None
+
+        # The `NeuralNetClassifier` or `NeuralNetRegressor` always require `y`
+        # Only `NeuralNet` can transfer `y=None` to `train_split` method.
+        net = NeuralNet(
+            MLPModule,  # Any model, it's not important here
+            module__input_units=n_features,
+            max_epochs=2,  # Run train loop twice to detect possible errors
+            criterion=UnsupervisedLoss,
+            **kwargs,
+        )
+
+        # Check if the code should fail or not
+        with raises:
+            net.fit(X, y)
 
 
 class TestNetSparseInput:

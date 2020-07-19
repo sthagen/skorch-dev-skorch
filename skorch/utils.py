@@ -6,10 +6,10 @@ Should not have any dependency on other skorch packages.
 
 from collections.abc import Sequence
 from contextlib import contextmanager
+from distutils.version import LooseVersion
 from enum import Enum
 from functools import partial
 from itertools import tee
-from distutils.version import LooseVersion
 import pathlib
 import warnings
 
@@ -104,14 +104,24 @@ def to_tensor(X, device, accept_sparse=False):
 def to_numpy(X):
     """Generic function to convert a pytorch tensor to numpy.
 
+    This function tries to unpack the tensor(s) from supported
+    data structures (e.g., dicts, lists, etc.) but doesn't go
+    beyond.
+
     Returns X when it already is a numpy array.
 
     """
     if isinstance(X, np.ndarray):
         return X
 
+    if isinstance(X, dict):
+        return {key: to_numpy(val) for key, val in X.items()}
+
     if is_pandas_ndframe(X):
         return X.values
+
+    if isinstance(X, (tuple, list)):
+        return type(X)(to_numpy(x) for x in X)
 
     if not is_torch_data_type(X):
         raise TypeError("Cannot convert this data type to a numpy array.")
@@ -135,6 +145,7 @@ def to_device(X, device):
 
          * torch tensor
          * tuple of torch tensors
+         * dict of torch tensors
          * PackSequence instance
          * torch.nn.Module
 
@@ -146,9 +157,12 @@ def to_device(X, device):
     if device is None:
         return X
 
+    if isinstance(X, dict):
+        return {key: to_device(val,device) for key, val in X.items()}
+
     # PackedSequence class inherits from a namedtuple
-    if isinstance(X, tuple) and (type(X) != PackedSequence):
-        return tuple(x.to(device) for x in X)
+    if isinstance(X, (tuple, list)) and (type(X) != PackedSequence):
+        return type(X)(to_device(x, device) for x in X)
     return X.to(device)
 
 
@@ -475,7 +489,7 @@ class FirstStepAccumulator:
         return self.step
 
 
-def _make_split(X, y, valid_ds, **kwargs):
+def _make_split(X, valid_ds, **kwargs):
     """Used by ``predefined_split`` to allow for pickling"""
     return X, valid_ds
 
