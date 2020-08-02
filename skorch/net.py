@@ -22,8 +22,11 @@ from skorch.dataset import uses_placeholder_y
 from skorch.exceptions import DeviceWarning
 from skorch.history import History
 from skorch.setter import optimizer_setter
+from skorch.utils import _identity
+from skorch.utils import _infer_predict_nonlinearty
 from skorch.utils import FirstStepAccumulator
 from skorch.utils import TeeGenerator
+from skorch.utils import _check_f_arguments
 from skorch.utils import check_is_fitted
 from skorch.utils import duplicate_items
 from skorch.utils import get_map_location
@@ -152,6 +155,33 @@ class NeuralNet:
       ``net.set_params(callbacks__print_log__keys_ignored=['epoch',
       'train_loss'])``).
 
+    predict_nonlinearity : callable, None, or 'auto' (default='auto')
+      The nonlinearity to be applied to the prediction. When set to
+      'auto', infers the correct nonlinearity based on the criterion
+      (softmax for :class:`~torch.nn.CrossEntropyLoss` and sigmoid for
+      :class:`~torch.nn.BCEWithLogitsLoss`). If it cannot be inferred
+      or if the parameter is None, just use the identity
+      function. Don't pass a lambda function if you want the net to be
+      pickleable.
+
+      In case a callable is passed, it should accept the output of the
+      module (the first output if there is more than one), which is a
+      PyTorch tensor, and return the transformed PyTorch tensor.
+
+      This can be useful, e.g., when
+      :func:`~skorch.NeuralNetClassifier.predict_proba`
+      should return probabilities but a criterion is used that does
+      not expect probabilities. In that case, the module can return
+      whatever is required by the criterion and the
+      ``predict_nonlinearity`` transforms this output into
+      probabilities.
+
+      The nonlinearity is applied only when calling
+      :func:`~skorch.classifier.NeuralNetClassifier.predict` or
+      :func:`~skorch.classifier.NeuralNetClassifier.predict_proba` but
+      not anywhere else -- notably, the loss is unaffected by this
+      nonlinearity.
+
     warm_start : bool (default=False)
       Whether each fit call should lead to a re-initialization of the
       module (cold start) or whether the module should be trained
@@ -213,6 +243,7 @@ class NeuralNet:
             dataset=Dataset,
             train_split=CVSplit(5),
             callbacks=None,
+            predict_nonlinearity='auto',
             warm_start=False,
             verbose=1,
             device='cpu',
@@ -229,6 +260,7 @@ class NeuralNet:
         self.dataset = dataset
         self.train_split = train_split
         self.callbacks = callbacks
+        self.predict_nonlinearity = predict_nonlinearity
         self.warm_start = warm_start
         self.verbose = verbose
         self.device = device
@@ -1010,6 +1042,45 @@ class NeuralNet:
             return self.module_(**x_dict)
         return self.module_(x, **fit_params)
 
+    def _get_predict_nonlinearity(self):
+        """Return the nonlinearity to be applied to the prediction
+
+        This can be useful, e.g., when
+        :func:`~skorch.classifier.NeuralNetClassifier.predict_proba`
+        should return probabilities but a criterion is used that does
+        not expect probabilities. In that case, the module can return
+        whatever is required by the criterion and the
+        ``predict_nonlinearity`` transforms this output into
+        probabilities.
+
+        The nonlinearity is applied only when calling
+        :func:`~skorch.classifier.NeuralNetClassifier.predict` or
+        :func:`~skorch.classifier.NeuralNetClassifier.predict_proba`
+        but not anywhere else -- notably, the loss is unaffected by
+        this nonlinearity.
+
+        Raises
+        ------
+        TypeError
+          Raise a TypeError if the return value is not callable.
+
+        Returns
+        -------
+        nonlin : callable
+          A callable that takes a single argument, which is a PyTorch
+          tensor, and returns a PyTorch tensor.
+
+        """
+        self.check_is_fitted()
+        nonlin = self.predict_nonlinearity
+        if nonlin is None:
+            nonlin = _identity
+        elif nonlin == 'auto':
+            nonlin = _infer_predict_nonlinearty(self)
+        if not callable(nonlin):
+            raise TypeError("predict_nonlinearity has to be a callable, 'auto' or None")
+        return nonlin
+
     def predict_proba(self, X):
         """Return the output of the module's forward method as a numpy
         array.
@@ -1041,9 +1112,11 @@ class NeuralNet:
         y_proba : numpy ndarray
 
         """
+        nonlin = self._get_predict_nonlinearity()
         y_probas = []
         for yp in self.forward_iter(X, training=False):
             yp = yp[0] if isinstance(yp, tuple) else yp
+            yp = nonlin(yp)
             y_probas.append(to_numpy(yp))
         y_proba = np.concatenate(y_probas, 0)
         return y_proba
@@ -1716,8 +1789,36 @@ class NeuralNet:
         self._unregister_attribute(name)
         super().__delattr__(name)
 
+    def _get_module(self, name, msg):
+        """Return the PyTorch module with the given name
+
+        If a module with such a name doesn't exist, also check the
+        name without trailing underscore.
+
+        Raises
+        ------
+        AttributeError
+          If no module with the given name could be found, with a
+          message formatted according to the passed ``msg`` argument.
+
+        """
+        try:
+            module = getattr(self, name)
+            if not hasattr(module, 'state_dict'):
+                raise AttributeError
+            return module
+        except AttributeError:
+            if name.endswith('_'):
+                name = name[:-1]
+            raise AttributeError(msg.format(name=name))
+
     def save_params(
-            self, f_params=None, f_optimizer=None, f_history=None):
+            self,
+            f_params=None,
+            f_optimizer=None,
+            f_criterion=None,
+            f_history=None,
+            **kwargs):
         """Saves the module's parameters, history, and optimizer,
         not the whole object.
 
@@ -1726,8 +1827,11 @@ class NeuralNet:
         ``classes_`` attribute on
         :class:`skorch.classifier.NeuralNetClassifier`.
 
-        ``f_params`` and ``f_optimizer`` uses PyTorchs'
+        ``f_params``, ``f_optimizer``, etc. use PyTorch's
         :func:`~torch.save`.
+
+        If you've created a custom module, e.g. ``net.mymodule_``, you
+        can save that as well by passing ``f_mymodule``.
 
         Parameters
         ----------
@@ -1737,6 +1841,9 @@ class NeuralNet:
         f_optimizer : file-like object, str, None (default=None)
           Path of optimizer. Pass ``None`` to not save
 
+        f_criterion : file-like object, str, None (default=None)
+          Path of criterion. Pass ``None`` to not save
+
         f_history : file-like object, str, None (default=None)
           Path to history. Pass ``None`` to not save
 
@@ -1744,30 +1851,44 @@ class NeuralNet:
         --------
         >>> before = NeuralNetClassifier(mymodule)
         >>> before.save_params(f_params='model.pkl',
-        >>>                    f_optimizer='optimizer.pkl',
-        >>>                    f_history='history.json')
+        ...                    f_optimizer='optimizer.pkl',
+        ...                    f_history='history.json')
         >>> after = NeuralNetClassifier(mymodule).initialize()
         >>> after.load_params(f_params='model.pkl',
-        >>>                   f_optimizer='optimizer.pkl',
-        >>>                   f_history='history.json')
+        ...                   f_optimizer='optimizer.pkl',
+        ...                   f_history='history.json')
 
         """
-        if f_params is not None:
-            msg = (
-                "Cannot save parameters of an un-initialized model. "
-                "Please initialize first by calling .initialize() "
-                "or by fitting the model with .fit(...).")
-            self.check_is_fitted(msg=msg)
-            torch.save(self.module_.state_dict(), f_params)
+        kwargs_module, kwargs_other = _check_f_arguments(
+            'save_params',
+            f_params=f_params,
+            f_optimizer=f_optimizer,
+            f_criterion=f_criterion,
+            f_history=f_history,
+            **kwargs)
 
-        if f_optimizer is not None:
-            msg = (
-                "Cannot save state of an un-initialized optimizer. "
-                "Please initialize first by calling .initialize() "
-                "or by fitting the model with .fit(...).")
-            self.check_is_fitted(attributes=['optimizer_'], msg=msg)
-            torch.save(self.optimizer_.state_dict(), f_optimizer)
+        if not kwargs_module and not kwargs_other:
+            print("Nothing to save")
+            return
 
+        msg_init = (
+            "Cannot save state of an un-initialized model. "
+            "Please initialize first by calling .initialize() "
+            "or by fitting the model with .fit(...).")
+        msg_module = (
+            "You are trying to save 'f_{name}' but for that to work, the net "
+            "needs to have an attribute called 'net.{name}_' that is a PyTorch "
+            "Module; make sure that it exists and check for typos.")
+
+        for attr, f_name in kwargs_module.items():
+            # valid attrs can be 'module_', 'optimizer_', etc.
+            if attr[:-1] in self.prefixes_:
+                self.check_is_fitted([attr], msg=msg_init)
+            module = self._get_module(attr, msg=msg_module)
+            torch.save(module.state_dict(), f_name)
+
+        # only valid key in kwargs_other is f_history
+        f_history = kwargs_other.get('f_history')
         if f_history is not None:
             self.history.to_file(f_history)
 
@@ -1789,15 +1910,23 @@ class NeuralNet:
         return requested_device
 
     def load_params(
-            self, f_params=None, f_optimizer=None, f_history=None,
-            checkpoint=None):
+            self,
+            f_params=None,
+            f_optimizer=None,
+            f_criterion=None,
+            f_history=None,
+            checkpoint=None,
+            **kwargs):
         """Loads the the module's parameters, history, and optimizer,
         not the whole object.
 
         To save and load the whole object, use pickle.
 
-        ``f_params`` and ``f_optimizer`` uses PyTorchs'
-        :func:`~torch.save`.
+        ``f_params``, ``f_optimizer``, etc. uses PyTorch's
+        :func:`~torch.load`.
+
+        If you've created a custom module, e.g. ``net.mymodule_``, you
+        can save that as well by passing ``f_mymodule``.
 
         Parameters
         ----------
@@ -1806,6 +1935,9 @@ class NeuralNet:
 
         f_optimizer : file-like object, str, None (default=None)
           Path of optimizer. Pass ``None`` to not load.
+
+        f_criterion : file-like object, str, None (default=None)
+          Path of criterion. Pass ``None`` to not save
 
         f_history : file-like object, str, None (default=None)
           Path to history. Pass ``None`` to not load.
@@ -1832,35 +1964,48 @@ class NeuralNet:
             self.device = self._check_device(self.device, map_location)
             return torch.load(f, map_location=map_location)
 
-        if f_history is not None:
-            self.history = History.from_file(f_history)
-
+        kwargs_full = {}
         if checkpoint is not None:
             if not self.initialized_:
                 self.initialize()
             if f_history is None and checkpoint.f_history is not None:
                 self.history = History.from_file(checkpoint.f_history_)
-            formatted_files = checkpoint.get_formatted_files(self)
-            f_params = f_params or formatted_files['f_params']
-            f_optimizer = f_optimizer or formatted_files['f_optimizer']
+            kwargs_full.update(**checkpoint.get_formatted_files(self))
 
-        if f_params is not None:
-            msg = (
-                "Cannot load parameters of an un-initialized model. "
-                "Please initialize first by calling .initialize() "
-                "or by fitting the model with .fit(...).")
-            self.check_is_fitted(msg=msg)
-            state_dict = _get_state_dict(f_params)
-            self.module_.load_state_dict(state_dict)
+        # explicit arguments may override checkpoint arguments
+        kwargs_full.update(**kwargs)
+        for key, val in [('f_params', f_params), ('f_optimizer', f_optimizer),
+                         ('f_criterion', f_criterion), ('f_history', f_history)]:
+            if val:
+                kwargs_full[key] = val
 
-        if f_optimizer is not None:
-            msg = (
-                "Cannot load state of an un-initialized optimizer. "
-                "Please initialize first by calling .initialize() "
-                "or by fitting the model with .fit(...).")
-            self.check_is_fitted(attributes=['optimizer_'], msg=msg)
-            state_dict = _get_state_dict(f_optimizer)
-            self.optimizer_.load_state_dict(state_dict)
+        kwargs_module, kwargs_other = _check_f_arguments('load_params', **kwargs_full)
+
+        if not kwargs_module and not kwargs_other:
+            print("Nothing to load")
+            return
+
+        # only valid key in kwargs_other is f_history
+        f_history = kwargs_other.get('f_history')
+        if f_history is not None:
+            self.history = History.from_file(f_history)
+
+        msg_init = (
+            "Cannot load state of an un-initialized model. "
+            "Please initialize first by calling .initialize() "
+            "or by fitting the model with .fit(...).")
+        msg_module = (
+            "You are trying to load 'f_{name}' but for that to work, the net "
+            "needs to have an attribute called 'net.{name}_' that is a PyTorch "
+            "Module; make sure that it exists and check for typos.")
+
+        for attr, f_name in kwargs_module.items():
+            # valid attrs can be 'module_', 'optimizer_', etc.
+            if attr[:-1] in self.prefixes_:
+                self.check_is_fitted([attr], msg=msg_init)
+            module = self._get_module(attr, msg=msg_module)
+            state_dict = _get_state_dict(f_name)
+            module.load_state_dict(state_dict)
 
     def __repr__(self):
         to_include = ['module']

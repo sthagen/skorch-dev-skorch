@@ -17,6 +17,8 @@ import numpy as np
 from scipy import sparse
 import sklearn
 import torch
+from torch.nn import BCEWithLogitsLoss
+from torch.nn import CrossEntropyLoss
 from torch.nn.utils.rnn import PackedSequence
 from torch.utils.data.dataset import Subset
 
@@ -544,12 +546,65 @@ def check_is_fitted(estimator, attributes, msg=None, all_or_any=all):
                "'initialize' or 'fit' with appropriate arguments "
                "before using this method.")
 
-
     if not isinstance(attributes, (list, tuple)):
         attributes = [attributes]
 
     if not all_or_any([hasattr(estimator, attr) for attr in attributes]):
         raise NotInitializedError(msg % {'name': type(estimator).__name__})
+
+
+def _identity(x):
+    """Return input as is, the identity operation"""
+    return x
+
+
+def _sigmoid_then_2d(x):
+    """Transform 1-dim logits to valid y_proba
+
+    Sigmoid is applied to x to transform it to probabilities. Then
+    concatenate the probabilities with 1 - these probabilities to
+    return a correctly formed ``y_proba``. This is required for
+    sklearn, which expects probabilities to be 2d arrays whose sum
+    along axis 1 is 1.0.
+
+    Parameters
+    ----------
+    x : torch.tensor
+      A 1 dimensional float torch tensor containing raw logits.
+
+    Returns
+    -------
+    y_proba : torch.tensor
+      A 2 dimensional float tensor of probabilities that sum up to 1
+      on axis 1.
+
+    """
+    prob = torch.sigmoid(x)
+    y_proba = torch.stack((1 - prob, prob), 1)
+    return y_proba
+
+
+def _infer_predict_nonlinearty(net):
+    """Infers the correct nonlinearity to apply for this net
+
+    The nonlinearity is applied only when calling
+    :func:`~skorch.classifier.NeuralNetClassifier.predict` or
+    :func:`~skorch.classifier.NeuralNetClassifier.predict_proba`.
+
+    """
+    # Implementation: At the moment, this function "dispatches" only
+    # based on the criterion, not the class of the net. We still pass
+    # the whole net as input in case we want to modify this at a
+    # future point in time.
+    criterion = net.criterion_
+
+    if isinstance(criterion, CrossEntropyLoss):
+        return partial(torch.softmax, dim=-1)
+
+    if isinstance(criterion, BCEWithLogitsLoss):
+        return _sigmoid_then_2d
+
+    return _identity
 
 
 class TeeGenerator:
@@ -564,3 +619,59 @@ class TeeGenerator:
     def __iter__(self):
         self.gen, it = tee(self.gen)
         yield from it
+
+
+def _check_f_arguments(caller_name, **kwargs):
+    """Check file name arguments and return them
+
+    This is used for checking if arguments to, e.g., ``save_params``
+    are correct.
+
+    Parameters
+    ----------
+    caller_name : str
+      Name of caller, is only required for the error message.
+
+    kwargs : dict
+      Keyword arguments that are intended to be checked.
+
+    Returns
+    -------
+    kwargs_module : dict
+      Keyword arguments for saving/loading modules.
+
+    kwargs_other : dict
+      Keyword arguments for saving/loading everything else.
+
+    Raises
+    ------
+    TypeError
+      There are two possibilities for arguments to be
+      incorrect. First, if they're not called 'f_*'. Second, if both
+      'f_params' and 'f_module' are passed, since those designate the
+      same thing.
+
+    """
+    if kwargs.get('f_params') and kwargs.get('f_module'):
+        raise TypeError("{} called with both f_params and f_module, please choose one"
+                        .format(caller_name))
+
+    kwargs_module = {}
+    kwargs_other = {}
+    keys_other = {'f_history', 'f_pickle'}
+    for key, val in kwargs.items():
+        if not key.startswith('f_'):
+            raise TypeError(
+                "{name} got an unexpected argument '{key}', did you mean 'f_{key}'?"
+                .format(name=caller_name, key=key))
+
+        if val is None:
+            continue
+        if key in keys_other:
+            kwargs_other[key] = val
+        else:
+            # strip 'f_' prefix and attach '_', and normalize 'params' to 'module'
+            # e.g. 'f_optimizer' becomes 'optimizer_', 'f_params' becomes 'module_'
+            key = 'module_' if key == 'f_params' else key[2:] + '_'
+            kwargs_module[key] = val
+    return kwargs_module, kwargs_other
