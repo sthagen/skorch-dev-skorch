@@ -491,7 +491,7 @@ class FirstStepAccumulator:
         return self.step
 
 
-def _make_split(X, valid_ds, **kwargs):
+def _make_split(X, y=None, valid_ds=None, **kwargs):
     """Used by ``predefined_split`` to allow for pickling"""
     return X, valid_ds
 
@@ -584,7 +584,7 @@ def _sigmoid_then_2d(x):
     return y_proba
 
 
-def _infer_predict_nonlinearty(net):
+def _infer_predict_nonlinearity(net):
     """Infers the correct nonlinearity to apply for this net
 
     The nonlinearity is applied only when calling
