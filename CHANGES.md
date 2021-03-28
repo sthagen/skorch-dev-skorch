@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.10.0] - 2021-03-23
+
+### Added
+
 - Added `SacredLogger` callback for logging to Sacred (#725)
 - CLI helper function now also supports normal (i.e. non-skorch) sklearn estimators
 - Disabling all callbacks is now supported (which allows reducing overhead,
@@ -19,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - We no longer pass the `epoch` parameter to LR schedulers, since that parameter has been deprecated. We now rely on the scheduler to keep track of the epoch itself.
 - Changed implementation of `net.history` access to make it faster; this should result in a nice speedup when dealing with very small model/data but otherwise not have any noticeable effects; if you encounter bugs, though, please create an issue
+- Changed the signature of `validation_step`, `train_step_single`, `train_step`, `evaluation_step`, `on_batch_begin`, and `on_batch_end` such that instead of receiving `X` and `y`, they receive the whole batch; this makes it easier to deal with datasets that don't strictly return an `(X, y)` tuple, which is true for quite a few PyTorch datasets; please refer to the [migration guide](https://skorch.readthedocs.io/en/stable/user/FAQ.html#migration-from-0-9-to-0-10) if you encounter problems
 
 ### Fixed
 
@@ -223,10 +232,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the net was configured to use the CPU (#354, #358)
 
 
-[Unreleased]: https://github.com/skorch-dev/skorch/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/skorch-dev/skorch/compare/v0.10.0...HEAD
 [0.4.0]: https://github.com/skorch-dev/skorch/compare/v0.3.0...v0.4.0
 [0.5.0]: https://github.com/skorch-dev/skorch/compare/v0.4.0...v0.5.0
 [0.6.0]: https://github.com/skorch-dev/skorch/compare/v0.5.0...v0.6.0
 [0.7.0]: https://github.com/skorch-dev/skorch/compare/v0.6.0...v0.7.0
 [0.8.0]: https://github.com/skorch-dev/skorch/compare/v0.7.0...v0.8.0
 [0.9.0]: https://github.com/skorch-dev/skorch/compare/v0.8.0...v0.9.0
+[0.10.0]: https://github.com/skorch-dev/skorch/compare/v0.9.0...v0.10.0
