@@ -12,10 +12,9 @@ from skorch.callbacks import EpochTimer
 from skorch.callbacks import PrintLog
 from skorch.callbacks import EpochScoring
 from skorch.callbacks import PassthroughScoring
-from skorch.dataset import CVSplit
-from skorch.utils import get_dim
+from skorch.dataset import ValidSplit
+from skorch.utils import get_dim, to_numpy
 from skorch.utils import is_dataset
-
 
 neural_net_clf_doc_start = """NeuralNet for classification tasks
 
@@ -61,7 +60,7 @@ class NeuralNetClassifier(NeuralNet, ClassifierMixin):
             module,
             *args,
             criterion=torch.nn.NLLLoss,
-            train_split=CVSplit(5, stratified=True),
+            train_split=ValidSplit(5, stratified=True),
             classes=None,
             **kwargs
     ):
@@ -117,7 +116,7 @@ class NeuralNetClassifier(NeuralNet, ClassifierMixin):
             raise ValueError(msg)
         if y is not None:
             # pylint: disable=attribute-defined-outside-init
-            self.classes_inferred_ = np.unique(y)
+            self.classes_inferred_ = np.unique(to_numpy(y))
 
     # pylint: disable=arguments-differ
     def get_loss(self, y_pred, y_true, *args, **kwargs):
@@ -244,7 +243,7 @@ class NeuralNetBinaryClassifier(NeuralNet, ClassifierMixin):
             module,
             *args,
             criterion=torch.nn.BCEWithLogitsLoss,
-            train_split=CVSplit(5, stratified=True),
+            train_split=ValidSplit(5, stratified=True),
             threshold=0.5,
             **kwargs
     ):
