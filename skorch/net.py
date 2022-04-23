@@ -7,6 +7,7 @@ sklearn-conforming classes like NeuralNetClassifier.
 """
 
 import fnmatch
+from collections.abc import Mapping
 from functools import partial
 from itertools import chain
 from collections import OrderedDict
@@ -29,6 +30,7 @@ from skorch.dataset import get_len
 from skorch.dataset import unpack_data
 from skorch.exceptions import DeviceWarning
 from skorch.exceptions import SkorchAttributeError
+from skorch.exceptions import SkorchTrainingImpossibleError
 from skorch.history import History
 from skorch.setter import optimizer_setter
 from skorch.utils import _identity
@@ -203,11 +205,11 @@ class NeuralNet:
       summary scores are always logged in the history attribute,
       regardless of the verbose setting.
 
-    device : str, torch.device (default='cpu')
-      The compute device to be used. If set to 'cuda', data in torch
-      tensors will be pushed to cuda tensors before being sent to the
-      module. If set to None, then all compute devices will be left
-      unmodified.
+    device : str, torch.device, or None (default='cpu')
+      The compute device to be used. If set to 'cuda' in order to use
+      GPU acceleration, data in torch tensors will be pushed to cuda
+      tensors before being sent to the module. If set to None, then
+      all compute devices will be left unmodified.
 
     Attributes
     ----------
@@ -811,6 +813,8 @@ class NeuralNet:
 
     def initialize(self):
         """Initializes all of its components and returns self."""
+        self.check_training_readiness()
+
         self._initialize_virtual_params()
         self._initialize_callbacks()
         self._initialize_module()
@@ -822,6 +826,16 @@ class NeuralNet:
 
         self.initialized_ = True
         return self
+
+    def check_training_readiness(self):
+        """Check that the net is ready to train"""
+        is_trimmed_for_prediction = getattr(self, '_trimmed_for_prediction', False)
+        if is_trimmed_for_prediction:
+            msg = (
+                "The net's attributes were trimmed for prediction, thus it cannot "
+                "be used for training anymore"
+            )
+            raise SkorchTrainingImpossibleError(msg)
 
     def check_data(self, X, y=None):
         pass
@@ -1072,6 +1086,7 @@ class NeuralNet:
 
         """
         self.check_data(X, y)
+        self.check_training_readiness()
         epochs = epochs if epochs is not None else self.max_epochs
 
         dataset_train, dataset_valid = self.get_split_datasets(
@@ -1080,26 +1095,30 @@ class NeuralNet:
             'dataset_train': dataset_train,
             'dataset_valid': dataset_valid,
         }
+        iterator_train = self.get_iterator(dataset_train, training=True)
+        iterator_valid = None
+        if dataset_valid is not None:
+            iterator_valid = self.get_iterator(dataset_valid, training=False)
 
         for _ in range(epochs):
             self.notify('on_epoch_begin', **on_epoch_kwargs)
 
-            self.run_single_epoch(dataset_train, training=True, prefix="train",
+            self.run_single_epoch(iterator_train, training=True, prefix="train",
                                   step_fn=self.train_step, **fit_params)
 
-            self.run_single_epoch(dataset_valid, training=False, prefix="valid",
+            self.run_single_epoch(iterator_valid, training=False, prefix="valid",
                                   step_fn=self.validation_step, **fit_params)
 
             self.notify("on_epoch_end", **on_epoch_kwargs)
         return self
 
-    def run_single_epoch(self, dataset, training, prefix, step_fn, **fit_params):
+    def run_single_epoch(self, iterator, training, prefix, step_fn, **fit_params):
         """Compute a single epoch of train or validation.
 
         Parameters
         ----------
-        dataset : torch Dataset or None
-          The initialized dataset to loop over. If None, skip this step.
+        iterator : torch DataLoader or None
+          The initialized ``DataLoader`` to loop over. If None, skip this step.
 
         training : bool
           Whether to set the module to train mode or not.
@@ -1112,12 +1131,13 @@ class NeuralNet:
 
         **fit_params : dict
           Additional parameters passed to the ``step_fn``.
+
         """
-        if dataset is None:
+        if iterator is None:
             return
 
         batch_count = 0
-        for batch in self.get_iterator(dataset, training=training):
+        for batch in iterator:
             self.notify("on_batch_begin", batch=batch, training=training)
             step = step_fn(batch, **fit_params)
             self.history.record_batch(prefix + "_loss", step["loss"].item())
@@ -1236,6 +1256,59 @@ class NeuralNet:
         attributes = attributes or ['module_']
         check_is_fitted(self, attributes, *args, **kwargs)
 
+    def trim_for_prediction(self):
+        """Remove all attributes not required for prediction.
+
+        Use this method after you finished training your net, with the goal of
+        reducing its size. All attributes only required during training (e.g.
+        the optimizer) are set to None. This can lead to a considerable decrease
+        in memory footprint. It also makes it more likely that the net can be
+        loaded with different library versions.
+
+        After calling this function, the net can only be used for prediction
+        (e.g. ``net.predict`` or ``net.predict_proba``) but no longer for
+        training (e.g. ``net.fit(X, y)`` will raise an exception).
+
+        This operation is irreversible. Once the net has been trimmed for
+        prediction, it is no longer possible to restore the original state.
+        Morevoer, this operation mutates the net. If you need the unmodified
+        net, create a deepcopy before trimming:
+
+        .. code:: python
+
+            from copy import deepcopy
+            net = NeuralNet(...)
+            net.fit(X, y)
+            # training finished
+            net_original = deepcopy(net)
+            net.trim_for_prediction()
+            net.predict(X)
+
+        """
+        # pylint: disable=protected-access
+        if getattr(self, '_trimmed_for_prediction', False):
+            return
+
+        self.check_is_fitted()
+        # pylint: disable=attribute-defined-outside-init
+        self._trimmed_for_prediction = True
+        self._set_training(False)
+
+        if isinstance(self.callbacks, list):
+            self.callbacks.clear()
+        self.callbacks_.clear()
+
+        self.train_split = None
+        self.iterator_train = None
+        self.history.clear()
+
+        attrs_to_trim = self._optimizers[:] + self._criteria[:]
+
+        for name in attrs_to_trim:
+            setattr(self, name + '_', None)
+            if hasattr(self, name):
+                setattr(self, name, None)
+
     def forward_iter(self, X, training=False, device='cpu'):
         """Yield outputs of module forward calls on each batch of data.
         The storage device of the yielded tensors is determined
@@ -1353,7 +1426,7 @@ class NeuralNet:
 
         """
         x = to_tensor(x, device=self.device)
-        if isinstance(x, dict):
+        if isinstance(x, Mapping):
             x_dict = self._merge_x_and_fit_params(x, fit_params)
             return self.module_(**x_dict)
         return self.module_(x, **fit_params)
@@ -1632,6 +1705,19 @@ class NeuralNet:
           mini-batches.
 
         """
+        # TODO: remove in skorch v0.13, see #835
+        if isinstance(dataset, DataLoader):
+            msg = (
+                "get_iterator was called with a DataLoader instance but it should be "
+                "called with a Dataset instead. Probably, you implemented a custom "
+                "run_single_epoch method. Its first argument is now a DataLoader, "
+                "not a Dataset. For more information, look here: "
+                "https://skorch.readthedocs.io/en/latest/user/FAQ.html"
+                "#migration-from-0-11-to-0-12. This will raise an error in skorch v0.13"
+            )
+            warnings.warn(msg, DeprecationWarning)
+            return dataset
+
         if training:
             kwargs = self.get_params_for('iterator_train')
             iterator = self.iterator_train
