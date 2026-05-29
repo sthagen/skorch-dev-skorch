@@ -59,6 +59,13 @@ def is_geometric_data_type(x):
     return isinstance(x, Data)
 
 
+def _check_device(device):
+    """Resolve special device shortcuts."""
+    if device == 'auto':
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+    return device
+
+
 # pylint: disable=not-callable
 def to_tensor(X, device, accept_sparse=False):
     """Turn input data to torch tensor.
@@ -77,7 +84,8 @@ def to_tensor(X, device, accept_sparse=False):
     device : str, torch.device
       The compute device to be used. If set to 'cuda', data in torch
       tensors will be pushed to cuda tensors before being sent to the
-      module.
+      module. If set to 'auto', hardware acceleration like CUDA is
+      being used if available, and CPU otherwise.
 
     accept_sparse : bool (default=False)
       Whether to accept scipy sparse matrices as input. If False,
@@ -89,6 +97,7 @@ def to_tensor(X, device, accept_sparse=False):
     output : torch Tensor
 
     """
+    device = _check_device(device)
     to_tensor_ = partial(to_tensor, device=device)
 
     if is_torch_data_type(X):
@@ -185,9 +194,12 @@ def to_device(X, device):
 
     device : str, torch.device
         The compute device to be used. If device=None, return the input
-        unmodified
+        unmodified. If device='auto', hardware acceleration like CUDA
+        is being used if available, and CPU otherwise.
 
     """
+    device = _check_device(device)
+
     if device is None:
         return X
 
@@ -562,6 +574,7 @@ def get_map_location(target_device, fallback_device='cpu'):
     """
     if target_device is None:
         target_device = fallback_device
+    target_device = _check_device(target_device)
 
     map_location = torch.device(target_device)
 
