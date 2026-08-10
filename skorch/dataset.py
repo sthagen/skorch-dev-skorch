@@ -312,7 +312,16 @@ class ValidSplit:
             raise bad_y_error
 
         # pylint: disable=invalid-name
-        len_dataset = get_len(dataset)
+        try:
+            len_dataset = get_len(dataset)
+        except TypeError as exc:
+            if not isinstance(dataset, torch.utils.data.IterableDataset):
+                raise
+            raise ValueError(
+                "Cannot perform a CV split on an IterableDataset because it has "
+                "no length. Set train_split=None to disable the internal "
+                "validation split, or pass a train_split that supports "
+                "IterableDataset.") from exc
         if y is not None:
             len_y = get_len(y)
             if len_dataset != len_y:
